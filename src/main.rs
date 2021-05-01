@@ -13,6 +13,8 @@ use cursive::views::{
     Button, Dialog, DummyView, EditView, LinearLayout, SelectView, TextArea, TextContent, TextView,
 };
 use cursive::Cursive;
+use std::thread;
+use std::time::Duration;
 
 struct YBLogReaderContext {
     yb_log_line_re: Regex,
@@ -63,12 +65,6 @@ impl YBLogReaderContext {
             peer_id_re: Regex::new(r"P ([0-9a-f]{32})\b").unwrap(),
         }
     }
-}
-
-struct YBLogReader<'a> {
-    file_name: String,
-    log_file: File,
-    context: &'a YBLogReaderContext,
 }
 
 #[derive(Debug)]
@@ -153,6 +149,18 @@ impl YBLogLine {
     }
 }
 
+struct YBLogReader<'a> {
+    file_name: String,
+    log_file: File,
+    context: &'a YBLogReaderContext,
+}
+
+#[derive(Debug)]
+struct LogReadProgress {
+    num_bytes: u64,
+    num_lines: u64
+}
+
 impl<'a> YBLogReader<'a> {
     fn new(
         file_name: &str,
@@ -166,33 +174,60 @@ impl<'a> YBLogReader<'a> {
         })
     }
 
-    pub fn load(&mut self) {
+    pub fn load<CB>(&mut self, progress_callback: CB)
+        where CB: Fn(LogReadProgress) {
         let reader = BufReader::new(&self.log_file);
+        let mut num_bytes: u64 = 0;
+        let mut num_lines: u64 = 0;
+        let mut last_progress_report_bytes: u64 = 0;
+        const REPORT_PROGRESS_EVERY_BYTES: u64 = 1024 * 1024;
         for maybe_line in reader.lines() {
             let line = maybe_line.unwrap();
+            num_bytes += line.bytes().len() as u64;
+            num_lines += 1;
+            if num_bytes >= last_progress_report_bytes + REPORT_PROGRESS_EVERY_BYTES {
+                progress_callback(LogReadProgress{num_bytes, num_lines});
+                last_progress_report_bytes += REPORT_PROGRESS_EVERY_BYTES;
+            }
             let maybe_parsed_line = YBLogLine::parse(line.as_str(), self.context);
             if let Some(parsed_line) = maybe_parsed_line {
-                println!("Parsed line: {:?}", parsed_line);
+                // println!("Parsed line: {:?}", parsed_line);
             } else {
-                println!("Could not parse line: {}", line);
+                // println!("Could not parse line: {}", line);
             }
         }
+        progress_callback(LogReadProgress{num_bytes, num_lines});
     }
 }
 
-fn cursive_main() {
-    let mut siv = cursive::default();
-    siv.add_global_callback('q', |s| s.quit());
-    let mut content = TextContent::new("content");
-    let view = TextView::new_with_content(content.clone()).fixed_size((200, 100));
 
-    // Later, possibly in a different thread
-    content.set_content("new content");
-
-    siv.add_layer(view);
-
-    siv.run();
-}
+//
+// fn cursive_main() {
+//     let mut siv = cursive::default();
+//     siv.add_global_callback('q', |s| s.quit());
+//     // let mut content = TextContent::new("content");
+//     let view = TextView::new("asdf").fixed_size((200, 200)).with_name("my_text_view");
+//
+//     let cb_sink = siv.cb_sink().clone();
+//
+//     let handle = thread::spawn(move || {
+//         for i in 1..10 {
+//             cb_sink.send(Box::new(move |s| {
+//                 // content.set_content(format!("hi number {} from the spawned thread!", i));
+//                 s.call_on_name("my_text_view", |view: &mut TextView| {
+//                     view.set_content(format!("Hello world! i={}", i));
+//                 });
+//             })).unwrap();
+//             thread::sleep(Duration::from_millis(500));
+//         }
+//         // content.set_content("Loop finished");
+//     });
+//
+//     siv.add_layer(view);
+//
+//     siv.run();
+//     handle.join().unwrap();
+// }
 
 fn main() {
     let matches = App::new("Yugabyte log processor")
@@ -230,11 +265,53 @@ fn main() {
 
     let reader_context = YBLogReaderContext::new();
 
-    let mut readers: Vec<YBLogReader> = Vec::new();
-    for input_file in input_files {
-        readers.push(YBLogReader::new(input_file.as_str(), &reader_context).unwrap());
-    }
 
+    let mut siv = cursive::default();
+    // siv.add_layer(Dialog::around(
+    //     TextView::new("Starting...").with_name("text"),
+    // ));
+    siv.add_global_callback('q', |s| s.quit());
+    siv.add_layer(Dialog::around(
+        TextView::new("Starting...").with_name("text").fixed_size((200, 200))
+    ));
+
+    let cb_sink = siv.cb_sink().clone();
+
+    let duration = std::time::Duration::from_millis(1000);
+    std::thread::spawn(move || {
+
+        let mut readers: Vec<YBLogReader> = Vec::new();
+        for input_file in input_files {
+            readers.push(YBLogReader::new(input_file.as_str(), &reader_context).unwrap());
+        }
+
+        for mut reader in readers {
+            reader.load(|progress| {
+                cb_sink
+                        .send(Box::new(move |s| {
+                            s.call_on_name("text", |v: &mut TextView| {
+                                v.set_content(format!("{:?}", progress));
+                            });
+                        }))
+                        .unwrap();
+            });
+        }
+
+
+        // for num in 0..25 {
+        //     std::thread::sleep(duration);
+        //     cb_sink
+        //         .send(Box::new(move |s| {
+        //             s.call_on_name("text", |v: &mut TextView| {
+        //                 v.set_content(num.to_string())
+        //             });
+        //         }))
+        //         .unwrap();
+        // }
+        // cb_sink.send(Box::new(|s| s.quit())).unwrap();
+    });
+
+    siv.run();
     // for mut reader in readers {
     //     reader.load();
     // }
@@ -259,6 +336,4 @@ fn main() {
     //     }
     // }
     // println!("Hello, world!");
-
-    cursive_main();
 }
