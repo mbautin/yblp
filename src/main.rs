@@ -15,6 +15,8 @@ use cursive::views::{
 use cursive::Cursive;
 use std::thread;
 use std::time::Duration;
+use chrono::format::Numeric::Timestamp;
+use std::cmp::Ordering;
 
 struct YBLogReaderContext {
     yb_log_line_re: Regex,
@@ -67,15 +69,20 @@ impl YBLogReaderContext {
     }
 }
 
-#[derive(Debug)]
-struct YBLogLine {
-    log_level: char,
+#[derive(Debug, PartialOrd, PartialEq, Clone)]
+struct TimestampWithoutYear {
     month: u8,
     day: u8,
     hour: u8,
     minute: u8,
     second: u8,
-    microsecond: i32,
+    microsecond: i32
+}
+
+#[derive(Debug)]
+struct YBLogLine {
+    log_level: char,
+    timestamp_without_year: TimestampWithoutYear,
     thread_id: i64,
     file_name: String,
     line_number: i32,
@@ -111,24 +118,26 @@ impl YBLogLine {
                     log_level: YBLogLine::parse_capture(
                         captures.get(YBLogReaderContext::CAPTURE_INDEX_LOG_LEVEL),
                     ),
-                    month: YBLogLine::parse_capture(
-                        captures.get(YBLogReaderContext::CAPTURE_INDEX_MONTH),
-                    ),
-                    day: YBLogLine::parse_capture(
-                        captures.get(YBLogReaderContext::CAPTURE_INDEX_DAY),
-                    ),
-                    hour: YBLogLine::parse_capture(
-                        captures.get(YBLogReaderContext::CAPTURE_INDEX_HOUR),
-                    ),
-                    minute: YBLogLine::parse_capture(
-                        captures.get(YBLogReaderContext::CAPTURE_INDEX_MINUTE),
-                    ),
-                    second: YBLogLine::parse_capture(
-                        captures.get(YBLogReaderContext::CAPTURE_INDEX_SECOND),
-                    ),
-                    microsecond: YBLogLine::parse_capture(
-                        captures.get(YBLogReaderContext::CAPTURE_INDEX_MICROSECOND),
-                    ),
+                    timestamp_without_year: TimestampWithoutYear {
+                        month: YBLogLine::parse_capture(
+                            captures.get(YBLogReaderContext::CAPTURE_INDEX_MONTH),
+                        ),
+                        day: YBLogLine::parse_capture(
+                            captures.get(YBLogReaderContext::CAPTURE_INDEX_DAY),
+                        ),
+                        hour: YBLogLine::parse_capture(
+                            captures.get(YBLogReaderContext::CAPTURE_INDEX_HOUR),
+                        ),
+                        minute: YBLogLine::parse_capture(
+                            captures.get(YBLogReaderContext::CAPTURE_INDEX_MINUTE),
+                        ),
+                        second: YBLogLine::parse_capture(
+                            captures.get(YBLogReaderContext::CAPTURE_INDEX_SECOND),
+                        ),
+                        microsecond: YBLogLine::parse_capture(
+                            captures.get(YBLogReaderContext::CAPTURE_INDEX_MICROSECOND),
+                        )
+                    },
                     thread_id: YBLogLine::parse_capture(
                         captures.get(YBLogReaderContext::CAPTURE_INDEX_THREAD_ID),
                     ),
@@ -181,6 +190,7 @@ impl<'a> YBLogReader<'a> {
         let mut num_lines: u64 = 0;
         let mut last_progress_report_bytes: u64 = 0;
         const REPORT_PROGRESS_EVERY_BYTES: u64 = 1024 * 1024;
+        let mut prev_ts: Option<TimestampWithoutYear> = None;
         for maybe_line in reader.lines() {
             let line = maybe_line.unwrap();
             num_bytes += line.bytes().len() as u64;
@@ -192,6 +202,11 @@ impl<'a> YBLogReader<'a> {
             let maybe_parsed_line = YBLogLine::parse(line.as_str(), self.context);
             if let Some(parsed_line) = maybe_parsed_line {
                 // println!("Parsed line: {:?}", parsed_line);
+                if let Some(prev_ts_value) = prev_ts.clone() {
+                    if (prev_ts_value >= parsed_line.timestamp_without_year) {
+                        panic!("Timestamps not ordered: was {:?}, now {:?}", prev_ts_value, parsed_line.timestamp_without_year);
+                    }
+                }
             } else {
                 // println!("Could not parse line: {}", line);
             }
