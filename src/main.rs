@@ -8,6 +8,9 @@ use uuid::Uuid;
 use chrono::NaiveDate;
 use std::str::FromStr;
 
+use cursive::Cursive;
+use cursive::views::{Button, Dialog, DummyView, EditView, LinearLayout, SelectView, TextArea, TextView, TextContent};
+use cursive::traits::*;
 
 struct YBLogReaderContext {
     yb_log_line_re: Regex,
@@ -81,7 +84,7 @@ struct YBLogLine {
     thread_id: i64,
     file_name: String,
     line_number: i32,
-    // tablet_id: Option<Uuid>,
+    tablet_id: Option<Uuid>,
     // peer_id: Option<Uuid>
 }
 
@@ -91,6 +94,17 @@ impl YBLogLine {
             result
         } else {
             panic!("Could not parse field {:?}", capture);
+        }
+    }
+
+    fn parse_tablet_id(line: &str, context: &YBLogReaderContext) -> Option<Uuid> {
+        match context.tablet_id_re.captures(line) {
+            Some(captures) =>
+                match Uuid::from_str(captures.get(1).unwrap().as_str()) {
+                    Ok(parsed_uuid) => Some(parsed_uuid),
+                    _ => None
+                },
+            _ => None
         }
     }
 
@@ -108,7 +122,8 @@ impl YBLogLine {
                     microsecond: YBLogLine::parse_capture(captures.get(YBLogReaderContext::CAPTURE_INDEX_MICROSECOND)),
                     thread_id: YBLogLine::parse_capture(captures.get(YBLogReaderContext::CAPTURE_INDEX_THREAD_ID)),
                     file_name: String::from(captures.get(YBLogReaderContext::CAPTURE_INDEX_FILE_NAME).unwrap().as_str()),
-                    line_number: YBLogLine::parse_capture(captures.get(YBLogReaderContext::CAPTURE_INDEX_LINE_NUMBER))
+                    line_number: YBLogLine::parse_capture(captures.get(YBLogReaderContext::CAPTURE_INDEX_LINE_NUMBER)),
+                    tablet_id: YBLogLine::parse_tablet_id(line, context)
                 }),
             _ =>
                 None
@@ -139,6 +154,21 @@ impl<'a> YBLogReader<'a> {
             }
         }
     }
+}
+
+fn cursive_main() {
+    let mut siv = cursive::default();
+    siv.add_global_callback('q', |s| s.quit());
+    let mut content = TextContent::new("content");
+    let view = TextView::new_with_content(content.clone()).fixed_size((200, 100));
+    
+
+    // Later, possibly in a different thread
+    content.set_content("new content");
+
+    siv.add_layer(view);
+
+    siv.run();
 }
 
 
@@ -178,9 +208,10 @@ fn main() {
         readers.push(YBLogReader::new(
             input_file.as_str(), &reader_context).unwrap());
     }
-    for mut reader in readers {
-        reader.load();
-    }
+
+    // for mut reader in readers {
+    //     reader.load();
+    // }
 
 
     //
@@ -203,4 +234,6 @@ fn main() {
     //     }
     // }
     // println!("Hello, world!");
+
+    cursive_main();
 }
