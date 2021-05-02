@@ -5,22 +5,14 @@ use std::path::Path;
 use std::str::FromStr;
 use std::sync::Mutex;
 
-
-
-
-
 use clap::{App, Arg};
 use flate2;
-
-
-
 use regex::Regex;
 use uuid::Uuid;
 
 struct YBLogReaderContext {
     yb_log_line_re: Regex,
     tablet_id_re: Regex,
-    peer_id_re: Regex,
 }
 
 impl YBLogReaderContext {
@@ -63,7 +55,6 @@ impl YBLogReaderContext {
             )
                 .unwrap(),
             tablet_id_re: Regex::new(r"T ([0-9a-f]{32})\b").unwrap(),
-            peer_id_re: Regex::new(r"P ([0-9a-f]{32})\b").unwrap(),
         }
     }
 }
@@ -86,47 +77,6 @@ struct YBLogLine {
     file_name: String,
     line_number: i32,
     tablet_id: Option<Uuid>,
-    // peer_id: Option<Uuid>
-}
-
-#[derive(Debug, Clone)]
-struct LineInFile {
-    index: u64,
-    line: String,
-    parsed: Option<YBLogLine>,
-}
-
-struct LogFileData {
-    lines: Vec<LineInFile>
-}
-
-struct LogFile {
-    mutex: Mutex<LogFileData>
-}
-
-impl LogFile {
-    fn new() -> LogFile {
-        LogFile {
-            mutex: Mutex::<LogFileData>::new(LogFileData { lines: Vec::new() })
-        }
-    }
-
-    fn add_line(&mut self, line: LineInFile) {
-        let mut data = self.mutex.lock().unwrap();
-        data.lines.push(line)
-    }
-
-    fn get_lines(&self, start_line: usize, num_lines: usize) -> Vec<LineInFile> {
-        let data = self.mutex.lock().unwrap();
-        let n = data.lines.len();
-        let last_index = min(n, start_line + num_lines);
-        let mut result = Vec::<LineInFile>::new();
-        result.reserve(last_index - start_line);
-        for i in start_line..last_index - 1 {
-            result.push(data.lines[i].clone());
-        }
-        result
-    }
 }
 
 impl YBLogLine {
@@ -251,12 +201,8 @@ impl<'a> YBLogReader<'a> {
     }
 
     pub fn load(&mut self) {
-        let mut num_bytes: u64 = 0;
-        let mut num_lines: u64 = 0;
         for maybe_line in &mut self.reader {
             let line = maybe_line.unwrap();
-            num_bytes += line.bytes().len() as u64;
-            num_lines += 1;
             let maybe_parsed_line = YBLogLine::parse(line.as_str(), self.context);
             if let Some(_parsed_line) = maybe_parsed_line {
                 // Parsing success
