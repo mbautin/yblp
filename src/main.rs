@@ -3,10 +3,12 @@ use clap::{App, Arg, SubCommand};
 use regex::Captures;
 use regex::Regex;
 use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Lines};
 use std::path::Path;
 use std::str::FromStr;
 use uuid::Uuid;
+use flate2::write::GzEncoder;
+use flate2::Compression;
 
 use cursive::traits::*;
 use cursive::views::{
@@ -16,7 +18,9 @@ use cursive::Cursive;
 use std::thread;
 use std::time::Duration;
 use chrono::format::Numeric::Timestamp;
-use std::cmp::Ordering;
+use std::cmp::{Ordering, min};
+use flate2;
+use std::sync::Mutex;
 
 struct YBLogReaderContext {
     yb_log_line_re: Regex,
@@ -79,7 +83,7 @@ struct TimestampWithoutYear {
     microsecond: i32
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct YBLogLine {
     log_level: char,
     timestamp_without_year: TimestampWithoutYear,
@@ -88,6 +92,46 @@ struct YBLogLine {
     line_number: i32,
     tablet_id: Option<Uuid>,
     // peer_id: Option<Uuid>
+}
+
+#[derive(Debug, Clone)]
+struct LineInFile {
+    index: u64,
+    line: String,
+    parsed: Option<YBLogLine>
+}
+
+struct LogFileData {
+    lines: Vec<LineInFile>
+}
+
+struct LogFile {
+    mutex: Mutex<LogFileData>
+}
+
+impl LogFile {
+    fn new() -> LogFile {
+        LogFile {
+            mutex: Mutex::<LogFileData>::new(LogFileData{ lines: Vec::new() } )
+        }
+    }
+
+    fn add_line(&mut self, line: LineInFile) {
+        let mut data  = self.mutex.lock().unwrap();
+        data.lines.push(line)
+    }
+
+    fn get_lines(&self, start_line: usize, num_lines: usize) -> Vec<LineInFile> {
+        let data  = self.mutex.lock().unwrap();
+        let n = data.lines.len();
+        let last_index = min(n, start_line + num_lines);
+        let mut result = Vec::<LineInFile>::new();
+        result.reserve(last_index - start_line);
+        for i in start_line..last_index - 1 {
+            result.push(data.lines[i].clone());
+        }
+        result
+    }
 }
 
 impl YBLogLine {
@@ -158,9 +202,40 @@ impl YBLogLine {
     }
 }
 
+enum FlexibleReader {
+    RawReader(BufReader<File>),
+    GzipReader(BufReader<flate2::read::GzDecoder<File>>)
+}
+
+impl std::iter::Iterator for FlexibleReader {
+    type Item = std::io::Result<String>;
+
+    fn next(&mut self) -> Option<std::io::Result<String>> {
+        let mut buf = String::new();
+        match {
+            match self {
+                FlexibleReader::RawReader(buf_reader) => buf_reader.read_line(&mut buf),
+                FlexibleReader::GzipReader(buf_reader) => buf_reader.read_line(&mut buf),
+            }
+        } {
+            Ok(0) => None,
+            Ok(_n) => {
+                if buf.ends_with('\n') {
+                    buf.pop();
+                    if buf.ends_with('\r') {
+                        buf.pop();
+                    }
+                }
+                Some(Ok(buf))
+            }
+            Err(e) => Some(Err(e)),
+        }
+    }
+}
+
 struct YBLogReader<'a> {
     file_name: String,
-    log_file: File,
+    reader: FlexibleReader,
     context: &'a YBLogReaderContext,
 }
 
@@ -178,20 +253,22 @@ impl<'a> YBLogReader<'a> {
         let opened_file = File::open(file_name)?;
         Ok(YBLogReader {
             file_name: String::from(file_name),
-            log_file: opened_file,
-            context,
+            reader: if file_name.ends_with(".gz") {
+                FlexibleReader::GzipReader(BufReader::new(flate2::read::GzDecoder::new(opened_file)))
+            } else {
+                FlexibleReader::RawReader(BufReader::new(opened_file))
+            },
+            context
         })
     }
 
-    pub fn load<CB>(&mut self, progress_callback: CB)
-        where CB: Fn(LogReadProgress) {
-        let reader = BufReader::new(&self.log_file);
+    pub fn load<CB>(&mut self, log_file: &mut LogFile, progress_callback: CB) where CB: Fn(LogReadProgress) {
         let mut num_bytes: u64 = 0;
         let mut num_lines: u64 = 0;
         let mut last_progress_report_bytes: u64 = 0;
         const REPORT_PROGRESS_EVERY_BYTES: u64 = 1024 * 1024;
         let mut prev_ts: Option<TimestampWithoutYear> = None;
-        for maybe_line in reader.lines() {
+        for maybe_line in &mut self.reader {
             let line = maybe_line.unwrap();
             num_bytes += line.bytes().len() as u64;
             num_lines += 1;
@@ -207,8 +284,18 @@ impl<'a> YBLogReader<'a> {
                         panic!("Timestamps not ordered: was {:?}, now {:?}", prev_ts_value, parsed_line.timestamp_without_year);
                     }
                 }
+                log_file.add_line(LineInFile{
+                    index: num_lines,
+                    line: line,
+                    parsed: Some(parsed_line)
+                });
             } else {
                 // println!("Could not parse line: {}", line);
+                log_file.add_line(LineInFile{
+                    index: num_lines,
+                    line: line,
+                    parsed: None
+                });
             }
         }
         progress_callback(LogReadProgress{num_bytes, num_lines});
@@ -293,6 +380,8 @@ fn main() {
     let cb_sink = siv.cb_sink().clone();
 
     let duration = std::time::Duration::from_millis(1000);
+    let mut log_files = Vec::<LogFile>::new();
+
     std::thread::spawn(move || {
 
         let mut readers: Vec<YBLogReader> = Vec::new();
@@ -301,15 +390,19 @@ fn main() {
         }
 
         for mut reader in readers {
-            reader.load(|progress| {
-                cb_sink
-                        .send(Box::new(move |s| {
-                            s.call_on_name("text", |v: &mut TextView| {
-                                v.set_content(format!("{:?}", progress));
-                            });
-                        }))
-                        .unwrap();
-            });
+            log_files.push(LogFile::new());
+
+            reader.load(
+                &mut log_files.
+                |progress| {
+                    cb_sink
+                            .send(Box::new(move |s| {
+                                s.call_on_name("text", |v: &mut TextView| {
+                                    v.set_content(format!("{:?}", progress));
+                                });
+                            }))
+                            .unwrap();
+                });
         }
 
 
