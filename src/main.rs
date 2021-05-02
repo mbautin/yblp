@@ -1,9 +1,9 @@
-use std::cmp::min;
+
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::str::FromStr;
-use std::sync::Mutex;
+
 
 use clap::{App, Arg};
 use flate2;
@@ -178,7 +178,6 @@ impl std::iter::Iterator for FlexibleReader {
 }
 
 struct YBLogReader<'a> {
-    file_name: String,
     reader: FlexibleReader,
     context: &'a YBLogReaderContext,
 }
@@ -190,7 +189,6 @@ impl<'a> YBLogReader<'a> {
     ) -> Result<YBLogReader<'a>, std::io::Error> {
         let opened_file = File::open(file_name)?;
         Ok(YBLogReader {
-            file_name: String::from(file_name),
             reader: if file_name.ends_with(".gz") {
                 FlexibleReader::GzipReader(BufReader::new(flate2::read::GzDecoder::new(opened_file)))
             } else {
