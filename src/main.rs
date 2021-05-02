@@ -1,19 +1,19 @@
 use std::cmp::min;
 use std::fs::File;
-use std::io::{BufRead, BufReader, Lines};
+use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::str::FromStr;
 use std::sync::Mutex;
-use std::thread;
-use std::time::Duration;
 
-use chrono::format::Numeric::Timestamp;
-use chrono::NaiveDate;
-use clap::{App, Arg, SubCommand};
+
+
+
+
+use clap::{App, Arg};
 use flate2;
-use flate2::Compression;
-use flate2::write::GzEncoder;
-use regex::Captures;
+
+
+
 use regex::Regex;
 use uuid::Uuid;
 
@@ -258,7 +258,7 @@ impl<'a> YBLogReader<'a> {
             num_bytes += line.bytes().len() as u64;
             num_lines += 1;
             let maybe_parsed_line = YBLogLine::parse(line.as_str(), self.context);
-            if let Some(parsed_line) = maybe_parsed_line {
+            if let Some(_parsed_line) = maybe_parsed_line {
                 // Parsing success
             } else {
                 // Parsing failure
