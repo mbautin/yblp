@@ -1,18 +1,25 @@
-
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::str::FromStr;
 
-
 use clap::{App, Arg};
 use flate2;
 use regex::Regex;
 use uuid::Uuid;
+use chrono::{NaiveDateTime, NaiveDate};
 
 struct YBLogReaderContext {
     yb_log_line_re: Regex,
     tablet_id_re: Regex,
+    log_file_created_at_re: Regex,
+    running_on_machine_re: Regex,
+    application_fingerprint_re: Regex,
+    application_fingerprint_details_re: Regex,
+}
+
+fn parse_regex(s: &str) -> Regex {
+    Regex::new(s).unwrap()
 }
 
 impl YBLogReaderContext {
@@ -26,10 +33,11 @@ impl YBLogReaderContext {
     const CAPTURE_INDEX_THREAD_ID: usize = 8;
     const CAPTURE_INDEX_FILE_NAME: usize = 9;
     const CAPTURE_INDEX_LINE_NUMBER: usize = 10;
+    const CAPTURE_INDEX_MESSAGE: usize = 11;
 
     fn new() -> YBLogReaderContext {
         YBLogReaderContext {
-            yb_log_line_re: Regex::new(
+            yb_log_line_re: parse_regex(
                 // Example: I0408 10:34:43.355123
                 concat!(
                 r"^",
@@ -50,11 +58,40 @@ impl YBLogReaderContext {
                 r"([0-9a-zA-Z_-]+[.][0-9a-zA-Z_-]+)", // // Capture group 9: file name
                 r":",
                 r"(\d+)", // Capture group 10: line number
-                r".*",
+                r"\] ",
+                r"(.*)",  // Capture group 11: message
                 ),
+            ),
+            tablet_id_re: parse_regex(r"T ([0-9a-f]{32})\b"),
+
+            // Log file "preamble" lines.
+            // ~~~~~~~~~~~~~~~~~~~~~~~~~
+            //
+            // Example:
+            //
+            // Log file created at: 2021/04/08 14:44:23
+            // Running on machine: yb-encust-stage-centralus-az1-vmLinux-1
+            // Application fingerprint: version 2.4.1.1 build 4 revision 1b7bb2fc3b910912ef758ffca83b076124051c10 build_type RELEASE built at 30 Mar 2021 16:14:23 UTC
+            // Running duration (h:mm:ss): 186:27:03
+            // Log line format: [IWEF]mmdd hh:mm:ss.uuuuuu threadid file:line] msg
+            //
+            log_file_created_at_re: parse_regex(
+                r"^Log file created at: (\d+{4})/(\d{2})/(\d{2})\s+(\d{2}):(\d{2}):(\d{2})$"
+            ),
+            running_on_machine_re: parse_regex(r"^Running on machine: (.*)$"),
+            application_fingerprint_re: parse_regex(r"^Application fingerprint: (.*)$"),
+            application_fingerprint_details_re: parse_regex(
+                concat!(
+                    r"^",
+                    r"version ([0-9.]+) ",
+                    r"build (\d+) ",
+                    r"revision ([a-f0-9]+) ",
+                    r"build_type ([a-zA-Z]+) ",
+                    r"built at (.*)"
+                )
             )
-                .unwrap(),
-            tablet_id_re: Regex::new(r"T ([0-9a-f]{32})\b").unwrap(),
+            // version 2.4.0.0 build 60 revision 4a56a6497b3bbc559f995d30f20f3859debce629 build_type
+            // RELEASE built at 21 Jan 2021 02:12:34 UTC
         }
     }
 }
@@ -79,15 +116,31 @@ struct YBLogLine {
     tablet_id: Option<Uuid>,
 }
 
-impl YBLogLine {
-    fn parse_capture<T: FromStr>(capture: Option<regex::Match>) -> T {
-        if let Ok(result) = capture.unwrap().as_str().parse::<T>() {
-            result
-        } else {
-            panic!("Could not parse field {:?}", capture);
-        }
-    }
+struct LogChunk {
+    sorting_timestamp: TimestampWithoutYear,
+}
 
+#[derive(Default)]
+struct YBLogFilePreamble {
+    created_at: Option<NaiveDateTime>,
+    running_on_machine: Option<String>,
+    application_fingerprint: Option<String>,
+    version: Option<String>,
+    build_number: Option<u64>,
+    revision: Option<String>,
+    build_type: Option<String>,
+    built_at: Option<String>
+}
+
+fn parse_capture<T: FromStr>(capture: Option<regex::Match>) -> T {
+    if let Ok(result) = capture.unwrap().as_str().parse::<T>() {
+        result
+    } else {
+        panic!("Could not parse field {:?}", capture);
+    }
+}
+
+impl YBLogLine {
     fn parse_tablet_id(line: &str, context: &YBLogReaderContext) -> Option<Uuid> {
         match context.tablet_id_re.captures(line) {
             Some(captures) => match Uuid::from_str(captures.get(1).unwrap().as_str()) {
@@ -103,30 +156,30 @@ impl YBLogLine {
             Some(captures) =>
                 {
                     Some(YBLogLine {
-                        log_level: YBLogLine::parse_capture(
+                        log_level: parse_capture(
                             captures.get(YBLogReaderContext::CAPTURE_INDEX_LOG_LEVEL),
                         ),
                         timestamp_without_year: TimestampWithoutYear {
-                            month: YBLogLine::parse_capture(
+                            month: parse_capture(
                                 captures.get(YBLogReaderContext::CAPTURE_INDEX_MONTH),
                             ),
-                            day: YBLogLine::parse_capture(
+                            day: parse_capture(
                                 captures.get(YBLogReaderContext::CAPTURE_INDEX_DAY),
                             ),
-                            hour: YBLogLine::parse_capture(
+                            hour: parse_capture(
                                 captures.get(YBLogReaderContext::CAPTURE_INDEX_HOUR),
                             ),
-                            minute: YBLogLine::parse_capture(
+                            minute: parse_capture(
                                 captures.get(YBLogReaderContext::CAPTURE_INDEX_MINUTE),
                             ),
-                            second: YBLogLine::parse_capture(
+                            second: parse_capture(
                                 captures.get(YBLogReaderContext::CAPTURE_INDEX_SECOND),
                             ),
-                            microsecond: YBLogLine::parse_capture(
+                            microsecond: parse_capture(
                                 captures.get(YBLogReaderContext::CAPTURE_INDEX_MICROSECOND),
                             ),
                         },
-                        thread_id: YBLogLine::parse_capture(
+                        thread_id: parse_capture(
                             captures.get(YBLogReaderContext::CAPTURE_INDEX_THREAD_ID),
                         ),
                         file_name: String::from(
@@ -135,7 +188,7 @@ impl YBLogLine {
                                 .unwrap()
                                 .as_str(),
                         ),
-                        line_number: YBLogLine::parse_capture(
+                        line_number: parse_capture(
                             captures.get(YBLogReaderContext::CAPTURE_INDEX_LINE_NUMBER),
                         ),
                         tablet_id: YBLogLine::parse_tablet_id(line, context),
@@ -180,6 +233,7 @@ impl std::iter::Iterator for FlexibleReader {
 struct YBLogReader<'a> {
     reader: FlexibleReader,
     context: &'a YBLogReaderContext,
+    preamble: YBLogFilePreamble
 }
 
 impl<'a> YBLogReader<'a> {
@@ -195,10 +249,13 @@ impl<'a> YBLogReader<'a> {
                 FlexibleReader::RawReader(BufReader::new(opened_file))
             },
             context,
+            preamble: Default::default()
         })
     }
 
     pub fn load(&mut self) {
+        let mut line_index: usize = 1;
+        const PREAMBLE_NUM_LINES: usize = 10;
         for maybe_line in &mut self.reader {
             let line = maybe_line.unwrap();
             let maybe_parsed_line = YBLogLine::parse(line.as_str(), self.context);
@@ -207,6 +264,25 @@ impl<'a> YBLogReader<'a> {
             } else {
                 // Parsing failure
             }
+
+            if line_index <= PREAMBLE_NUM_LINES {
+                match self.context.log_file_created_at_re.captures(line.as_str()) {
+                    Some(captures) =>
+                        self.preamble.created_at = Some(
+                            NaiveDate::from_ymd(
+                                parse_capture(captures.get(1)),
+                                parse_capture(captures.get(2)),
+                                parse_capture(captures.get(3))
+                            ).and_hms(
+                                parse_capture(captures.get(4)),
+                                parse_capture(captures.get(5)),
+                                parse_capture(captures.get(6))
+                            )
+                        ),
+                    _ => ()
+                }
+            }
+            line_index += 1;
         }
     }
 }
@@ -215,14 +291,6 @@ fn main() {
     let matches = App::new("Yugabyte log processor")
         .about("A tool for manipulating YugabyteDB logs")
         .version("1.0.0")
-        .arg(
-            Arg::with_name("config")
-                .short("c")
-                .long("config")
-                .value_name("FILE")
-                .help("Sets a custom config file")
-                .takes_value(true),
-        )
         .arg(
             Arg::with_name("INPUT")
                 .help("Sets the input file to use")
