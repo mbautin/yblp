@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+yblp_dir=$( cd "${BASH_SOURCE[0]%/*}/.." && pwd )
+cargo build --release
+$yblp_dir/target/release/yblp "$@"
+

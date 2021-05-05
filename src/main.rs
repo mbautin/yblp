@@ -266,20 +266,23 @@ impl<'a> YBLogReader<'a> {
             }
 
             if line_index <= PREAMBLE_NUM_LINES {
-                match self.context.log_file_created_at_re.captures(line.as_str()) {
-                    Some(captures) =>
-                        self.preamble.created_at = Some(
-                            NaiveDate::from_ymd(
-                                parse_capture(captures.get(1)),
-                                parse_capture(captures.get(2)),
-                                parse_capture(captures.get(3))
-                            ).and_hms(
-                                parse_capture(captures.get(4)),
-                                parse_capture(captures.get(5)),
-                                parse_capture(captures.get(6))
-                            )
-                        ),
-                    _ => ()
+                if let Some(captures) = self.context.log_file_created_at_re.captures(
+                    line.as_str()) {
+                    self.preamble.created_at = Some(
+                        NaiveDate::from_ymd(
+                            parse_capture(captures.get(1)),
+                            parse_capture(captures.get(2)),
+                            parse_capture(captures.get(3))
+                        ).and_hms(
+                            parse_capture(captures.get(4)),
+                            parse_capture(captures.get(5)),
+                            parse_capture(captures.get(6))
+                        )
+                    );
+                }
+                if let Some(captures) = self.context.running_on_machine_re.captures(line.as_str()) {
+                    self.preamble.running_on_machine = Some(
+                        String::from(captures.get(1).unwrap().as_str()));
                 }
             }
             line_index += 1;
