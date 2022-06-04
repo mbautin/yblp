@@ -2,12 +2,19 @@ use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::str::FromStr;
+use std::fs::metadata;
 
 use clap::{App, Arg};
 use flate2;
 use regex::Regex;
 use uuid::Uuid;
 use chrono::{NaiveDateTime, NaiveDate};
+use walkdir::WalkDir;
+use std::fs;
+use std::ffi::OsString;
+
+use std::collections::BTreeSet;
+
 
 extern crate yblp;
 
@@ -148,6 +155,7 @@ impl std::iter::Iterator for FlexibleReader {
 }
 
 struct YBLogReader<'a> {
+    file_name: String,
     reader: FlexibleReader,
     context: &'a YBLogReaderContext,
     preamble: YBLogFilePreamble
@@ -160,6 +168,7 @@ impl<'a> YBLogReader<'a> {
     ) -> Result<YBLogReader<'a>, std::io::Error> {
         let opened_file = File::open(file_name)?;
         Ok(YBLogReader {
+            file_name: String::from(file_name),
             reader: if file_name.ends_with(".gz") {
                 FlexibleReader::GzipReader(BufReader::new(flate2::read::GzDecoder::new(opened_file)))
             } else {
@@ -173,13 +182,17 @@ impl<'a> YBLogReader<'a> {
     pub fn load(&mut self) {
         let mut line_index: usize = 1;
         const PREAMBLE_NUM_LINES: usize = 10;
+        let mut successfully_parsed_lines: u64 = 0;
+        let mut unsuccessfully_parsed_lines: u64 = 0;
         for maybe_line in &mut self.reader {
             let line = maybe_line.unwrap();
             let maybe_parsed_line = YBLogLine::parse(line.as_str(), self.context);
             if let Some(_parsed_line) = maybe_parsed_line {
+                successfully_parsed_lines += 1;
                 // Parsing success
             } else {
                 // Parsing failure
+                unsuccessfully_parsed_lines += 1;
             }
 
             if line_index <= PREAMBLE_NUM_LINES {
@@ -204,6 +217,11 @@ impl<'a> YBLogReader<'a> {
             }
             line_index += 1;
         }
+        println!(
+            "In file {}: successfully parsed lines: {}, unsuccessfully parsed lines: {}",
+            self.file_name,
+            successfully_parsed_lines,
+            unsuccessfully_parsed_lines);
     }
 }
 
@@ -219,15 +237,29 @@ fn main() {
         )
         .get_matches();
 
-    let mut input_files: Vec<String> = Vec::new();
+    let mut input_files: BTreeSet<OsString> = BTreeSet::new();
     match matches.values_of("INPUT") {
         Some(values) => {
             for input_file in values {
-                println!("input file: {}", input_file);
-                if !Path::new(input_file).exists() {
-                    panic!("File {} does not exist", input_file);
+                let file_metadata = metadata(input_file).unwrap();
+                if file_metadata.is_file() {
+                    println!("input file: {}", input_file);
+                    if !Path::new(input_file).exists() {
+                        panic!("File {} does not exist", input_file);
+                    }
+                    input_files.insert(fs::canonicalize(input_file).unwrap().into_os_string());
+                } else if file_metadata.is_dir() {
+                    println!("Directory specifed on the command line: {}", input_file);
+                    for entry in WalkDir::new(input_file) {
+                        let path_unwrapped = entry.unwrap();
+                        let path_os_str = path_unwrapped.path();
+                        if metadata(path_os_str).unwrap().is_file() {
+                            input_files.insert(fs::canonicalize(path_os_str).unwrap().into_os_string());
+                        }
+                    }
+                } else {
+                    panic!("Not a file or directory: {}", input_file);
                 }
-                input_files.push(String::from(input_file));
             }
         }
         _ => panic!("No input files specified"),
@@ -236,7 +268,8 @@ fn main() {
     let mut readers = Vec::<YBLogReader>::new();
     let reader_context = YBLogReaderContext::new();
     for input_file in input_files {
-        readers.push(YBLogReader::new(input_file.as_str(), &reader_context).unwrap());
+        let input_file_str = input_file.to_str().unwrap();
+        readers.push(YBLogReader::new(input_file_str, &reader_context).unwrap());
     }
 
     for mut reader in readers {
