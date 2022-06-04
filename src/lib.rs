@@ -1,4 +1,6 @@
+use std::str::FromStr;
 use regex::Regex;
+use chrono::{NaiveDateTime, NaiveDate};
 
 fn parse_regex(s: &str) -> Regex {
     Regex::new(s).unwrap()
@@ -11,6 +13,42 @@ pub struct YBLogReaderContext {
     pub running_on_machine_re: Regex,
     pub application_fingerprint_re: Regex,
     pub application_fingerprint_details_re: Regex,
+}
+
+pub fn parse_capture<T: FromStr>(capture: Option<regex::Match>) -> T {
+    if let Ok(result) = capture.unwrap().as_str().parse::<T>() {
+        result
+    } else {
+        panic!("Could not parse field {:?}", capture);
+    }
+}
+
+pub fn parse_filter_timestamp(s_raw: &str) -> Result<NaiveDateTime, String> {
+    let s = s_raw.trim();
+    let ymd_regex_str = r"^(\d{4})-(\d{2})-(\d{2])";
+    let ymd_regex = parse_regex((String::from(ymd_regex_str) + "$").as_str());
+    if let Some(captures) = ymd_regex.captures(s) {
+        return Ok(
+            NaiveDate::from_ymd(
+                parse_capture(captures.get(1)),
+                parse_capture(captures.get(2)),
+                parse_capture(captures.get(3))
+            ).and_hms(0, 0, 0));
+    }
+    let ymdhms_regex = parse_regex(
+        (String::from(ymd_regex_str) + r" *(\d{4}):(\d{2}):(\d{2})$").as_str());
+    if let Some(captures) = ymdhms_regex.captures(s) {
+        return Ok(
+            NaiveDate::from_ymd(
+                parse_capture(captures.get(1)),
+                parse_capture(captures.get(2)),
+                parse_capture(captures.get(3))
+            ).and_hms(
+                parse_capture(captures.get(4)),
+                parse_capture(captures.get(5)),
+                parse_capture(captures.get(6))));
+    }
+    Err(format!("Could not parse timestamp '{}': expected YYYY-MM-DD or YYYY-MM-DD HH:MM:SS", s))
 }
 
 impl YBLogReaderContext {

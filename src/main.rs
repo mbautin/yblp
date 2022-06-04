@@ -1,7 +1,6 @@
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
-use std::str::FromStr;
 use std::fs::metadata;
 
 use clap::{App, Arg};
@@ -12,13 +11,18 @@ use chrono::{NaiveDateTime, NaiveDate};
 use walkdir::WalkDir;
 use std::fs;
 use std::ffi::OsString;
+use threadpool::ThreadPool;
 
+use std::str::FromStr;
 use std::collections::BTreeSet;
+use std::sync::Arc;
 
 
 extern crate yblp;
 
 use self::yblp::YBLogReaderContext;
+use self::yblp::parse_capture;
+use self::yblp::parse_filter_timestamp;
 
 #[derive(Debug, PartialOrd, PartialEq, Clone)]
 struct TimestampWithoutYear {
@@ -56,14 +60,6 @@ struct YBLogFilePreamble {
     built_at: Option<String>
 }
 
-fn parse_capture<T: FromStr>(capture: Option<regex::Match>) -> T {
-    if let Ok(result) = capture.unwrap().as_str().parse::<T>() {
-        result
-    } else {
-        panic!("Could not parse field {:?}", capture);
-    }
-}
-
 impl YBLogLine {
     fn parse_tablet_id(line: &str, context: &YBLogReaderContext) -> Option<Uuid> {
         match context.tablet_id_re.captures(line) {
@@ -75,7 +71,7 @@ impl YBLogLine {
         }
     }
 
-    pub fn parse(line: &str, context: &YBLogReaderContext) -> Option<YBLogLine> {
+    pub fn parse(line: &str, context: Arc<YBLogReaderContext>) -> Option<YBLogLine> {
         match context.yb_log_line_re.captures(line) {
             Some(captures) =>
                 {
@@ -115,7 +111,7 @@ impl YBLogLine {
                         line_number: parse_capture(
                             captures.get(YBLogReaderContext::CAPTURE_INDEX_LINE_NUMBER),
                         ),
-                        tablet_id: YBLogLine::parse_tablet_id(line, context),
+                        tablet_id: YBLogLine::parse_tablet_id(line, context.as_ref()),
                     })
                 }
             _ => None,
@@ -154,18 +150,18 @@ impl std::iter::Iterator for FlexibleReader {
     }
 }
 
-struct YBLogReader<'a> {
+struct YBLogReader {
     file_name: String,
     reader: FlexibleReader,
-    context: &'a YBLogReaderContext,
+    context: Arc<YBLogReaderContext>,
     preamble: YBLogFilePreamble
 }
 
-impl<'a> YBLogReader<'a> {
+impl YBLogReader {
     fn new(
         file_name: &str,
-        context: &'a YBLogReaderContext,
-    ) -> Result<YBLogReader<'a>, std::io::Error> {
+        context: Arc<YBLogReaderContext>,
+    ) -> Result<YBLogReader, std::io::Error> {
         let opened_file = File::open(file_name)?;
         Ok(YBLogReader {
             file_name: String::from(file_name),
@@ -186,7 +182,7 @@ impl<'a> YBLogReader<'a> {
         let mut unsuccessfully_parsed_lines: u64 = 0;
         for maybe_line in &mut self.reader {
             let line = maybe_line.unwrap();
-            let maybe_parsed_line = YBLogLine::parse(line.as_str(), self.context);
+            let maybe_parsed_line = YBLogLine::parse(line.as_str(), self.context.clone());
             if let Some(_parsed_line) = maybe_parsed_line {
                 successfully_parsed_lines += 1;
                 // Parsing success
@@ -226,6 +222,12 @@ impl<'a> YBLogReader<'a> {
 }
 
 fn main() {
+    fn timestamp_validator(v: String) -> Result<(), String> {
+        match parse_filter_timestamp(v.as_str()) {
+            Ok(_) => Ok(()),
+            Err(s) => Err(s)
+        }
+    }
     let matches = App::new("Yugabyte log processor")
         .about("A tool for manipulating YugabyteDB logs")
         .version("1.0.0")
@@ -234,6 +236,12 @@ fn main() {
                 .help("Sets the input file to use")
                 .required(true)
                 .multiple(true),
+        )
+        .arg(
+            Arg::with_name("FROM_TIMESTAMP")
+                .long("from_timestamp")
+                .help("Initial timestamp (inclusive) of the log range to look at (YYYY-MM-DD HH:MM:SS)")
+                .validator(timestamp_validator)
         )
         .get_matches();
 
@@ -249,7 +257,6 @@ fn main() {
                     }
                     input_files.insert(fs::canonicalize(input_file).unwrap().into_os_string());
                 } else if file_metadata.is_dir() {
-                    println!("Directory specifed on the command line: {}", input_file);
                     for entry in WalkDir::new(input_file) {
                         let path_unwrapped = entry.unwrap();
                         let path_os_str = path_unwrapped.path();
@@ -266,13 +273,21 @@ fn main() {
     }
 
     let mut readers = Vec::<YBLogReader>::new();
-    let reader_context = YBLogReaderContext::new();
+    let reader_context = Arc::new(YBLogReaderContext::new());
+
+    let cpus = num_cpus::get();
+    let pool = ThreadPool::new(cpus);
+
+    println!("Processing {} files", input_files.len());
     for input_file in input_files {
         let input_file_str = input_file.to_str().unwrap();
-        readers.push(YBLogReader::new(input_file_str, &reader_context).unwrap());
+        readers.push(YBLogReader::new(input_file_str, reader_context.clone()).unwrap());
     }
 
     for mut reader in readers {
-        reader.load();
+        pool.execute(move || {
+            reader.load();
+        })
     }
+    pool.join();
 }

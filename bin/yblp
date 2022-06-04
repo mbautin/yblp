@@ -1,5 +1,15 @@
 #!/usr/bin/env bash
+set -euo pipefail
 yblp_dir=$( cd "${BASH_SOURCE[0]%/*}/.." && pwd )
-cargo build --release
-$yblp_dir/target/release/yblp "$@"
+
+build_error_file_path=/tmp/yblp_build.err
+set +e
+cargo build --release 2>"${build_error_file_path}"
+build_exit_code=$?
+set -e
+if [[ $build_exit_code -ne 0 ]]; then
+  cat "${build_error_file_path}" >&2
+  exit "$build_exit_code"
+fi
+"$yblp_dir/target/release/yblp" "$@"
 
