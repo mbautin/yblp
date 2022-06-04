@@ -25,7 +25,7 @@ pub fn parse_capture<T: FromStr>(capture: Option<regex::Match>) -> T {
 
 pub fn parse_filter_timestamp(s_raw: &str) -> Result<NaiveDateTime, String> {
     let s = s_raw.trim();
-    let ymd_regex_str = r"^(\d{4})-(\d{2})-(\d{2])";
+    let ymd_regex_str = r"^(\d{4})-(\d{2})-(\d{2})";
     let ymd_regex = parse_regex((String::from(ymd_regex_str) + "$").as_str());
     if let Some(captures) = ymd_regex.captures(s) {
         return Ok(
@@ -36,7 +36,7 @@ pub fn parse_filter_timestamp(s_raw: &str) -> Result<NaiveDateTime, String> {
             ).and_hms(0, 0, 0));
     }
     let ymdhms_regex = parse_regex(
-        (String::from(ymd_regex_str) + r" *(\d{4}):(\d{2}):(\d{2})$").as_str());
+        (String::from(ymd_regex_str) + r"[ tT]*(\d{2}):(\d{2}):(\d{2})$").as_str());
     if let Some(captures) = ymdhms_regex.captures(s) {
         return Ok(
             NaiveDate::from_ymd(
@@ -48,7 +48,8 @@ pub fn parse_filter_timestamp(s_raw: &str) -> Result<NaiveDateTime, String> {
                 parse_capture(captures.get(5)),
                 parse_capture(captures.get(6))));
     }
-    Err(format!("Could not parse timestamp '{}': expected YYYY-MM-DD or YYYY-MM-DD HH:MM:SS", s))
+    Err(format!(
+        "Could not parse timestamp '{}': expected YYYY-MM-DD or YYYY-MM-DD[ tT]HH:MM:SS format", s))
 }
 
 impl YBLogReaderContext {

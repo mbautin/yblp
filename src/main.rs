@@ -16,7 +16,8 @@ use threadpool::ThreadPool;
 use std::str::FromStr;
 use std::collections::BTreeSet;
 use std::sync::Arc;
-
+use stable_vec::StableVec;
+use std::cell::RefCell;
 
 extern crate yblp;
 
@@ -221,13 +222,59 @@ impl YBLogReader {
     }
 }
 
-fn main() {
-    fn timestamp_validator(v: String) -> Result<(), String> {
-        match parse_filter_timestamp(v.as_str()) {
-            Ok(_) => Ok(()),
-            Err(s) => Err(s)
+fn timestamp_validator(v: String) -> Result<(), String> {
+    match parse_filter_timestamp(v.as_str()) {
+        Ok(_) => Ok(()),
+        Err(s) => Err(s)
+    }
+}
+
+fn get_timestamp_arg<'a>(values: Option<clap::Values<'a>>) -> Option<NaiveDateTime> {
+    match values.unwrap().next() {
+        Some(value_str) => {
+            Some(parse_filter_timestamp(value_str).unwrap())
+        },
+        None => None
+    }
+}
+
+fn capitalize_string(input: &str) -> String {
+    // From https://stackoverflow.com/questions/38406793/why-is-capitalizing-the-first-letter-of-a-string-so-convoluted-in-rust
+    let mut s = input.to_string();
+    return s.remove(0).to_uppercase().to_string() + &s;
+}
+
+struct TimestampArgHelper {
+    arg_name: String,
+    long_option_name: String,
+    help_text: String
+}
+
+impl TimestampArgHelper {
+    fn new(lowest_or_highest: &str) -> TimestampArgHelper {
+        TimestampArgHelper {
+            arg_name: String::from(lowest_or_highest.to_uppercase()) + "_TIMESTAMP",
+            long_option_name: String::from(lowest_or_highest.to_lowercase()) + "_timestamp",
+            help_text: std::format!(
+                    "{} timestamp (inclusive) of the log range to look at (YYYY-MM-DD HH:MM:SS)",
+                    capitalize_string(lowest_or_highest))
         }
     }
+
+    fn create_arg<'a>(&'a self) -> Arg<'a, 'a> {
+        Arg::with_name(self.arg_name.as_str())
+            .long(self.long_option_name.as_str())
+            .takes_value(true)
+            .help(self.help_text.as_str())
+            .validator(timestamp_validator)
+    }
+}
+
+
+fn main() {
+    let lowest_helper = TimestampArgHelper::new("lowest");
+    let highest_helper = TimestampArgHelper::new("highest");
+
     let matches = App::new("Yugabyte log processor")
         .about("A tool for manipulating YugabyteDB logs")
         .version("1.0.0")
@@ -237,13 +284,12 @@ fn main() {
                 .required(true)
                 .multiple(true),
         )
-        .arg(
-            Arg::with_name("FROM_TIMESTAMP")
-                .long("from_timestamp")
-                .help("Initial timestamp (inclusive) of the log range to look at (YYYY-MM-DD HH:MM:SS)")
-                .validator(timestamp_validator)
-        )
+        .arg(lowest_helper.create_arg())
+        .arg(highest_helper.create_arg())
         .get_matches();
+
+    let from_ts = get_timestamp_arg(matches.values_of("LOWEST_TIMESTAMP"));
+    let to_ts = get_timestamp_arg(matches.values_of("HIGHEST_TIMESTAMP"));
 
     let mut input_files: BTreeSet<OsString> = BTreeSet::new();
     match matches.values_of("INPUT") {
