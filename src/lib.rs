@@ -47,20 +47,16 @@ pub fn parse_filter_timestamp(s_raw: &str) -> Result<NaiveDateTime, String> {
 // YBLogReaderContext
 // ------------------------------------------------------------------------------------------------
 
-pub struct YBLogReaderContext {
+pub struct RegexHolder {
     pub yb_log_line_re: Regex,
     pub tablet_id_re: Regex,
     pub log_file_created_at_re: Regex,
     pub running_on_machine_re: Regex,
     pub application_fingerprint_re: Regex,
     pub application_fingerprint_details_re: Regex,
-
-    pub lowest_timestamp: Option<NaiveDateTime>,
-    pub highest_timestamp: Option<NaiveDateTime>,
-    pub default_year: Option<i32>,
 }
 
-impl YBLogReaderContext {
+impl RegexHolder {
     pub const CAPTURE_INDEX_LOG_LEVEL: usize = 1;
     pub const CAPTURE_INDEX_MONTH: usize = 2;
     pub const CAPTURE_INDEX_DAY: usize = 3;
@@ -73,8 +69,8 @@ impl YBLogReaderContext {
     pub const CAPTURE_INDEX_LINE_NUMBER: usize = 10;
     pub const CAPTURE_INDEX_MESSAGE: usize = 11;
 
-    pub fn new() -> YBLogReaderContext {
-        YBLogReaderContext {
+    pub fn new() -> RegexHolder {
+        RegexHolder {
             yb_log_line_re: parse_regex(
                 // Example: I0408 10:34:43.355123
                 concat!(
@@ -130,10 +126,6 @@ impl YBLogReaderContext {
             ),
             // version 2.4.0.0 build 60 revision 4a56a6497b3bbc559f995d30f20f3859debce629 build_type
             // RELEASE built at 21 Jan 2021 02:12:34 UTC
-
-            lowest_timestamp: None,
-            highest_timestamp: None,
-            default_year: None,
         }
     }
 }

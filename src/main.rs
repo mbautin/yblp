@@ -1,6 +1,7 @@
 #[macro_use]
 extern crate clap;
 
+use yblp::RegexHolder;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
@@ -20,14 +21,17 @@ use chrono::Datelike;
 use std::str::FromStr;
 use std::collections::BTreeSet;
 use std::sync::Arc;
-use stable_vec::StableVec;
 use std::cell::RefCell;
 
 extern crate yblp;
 
-use self::yblp::YBLogReaderContext;
 use self::yblp::parse_capture;
 use self::yblp::parse_filter_timestamp;
+
+struct YBLogReaderContext {
+    regexes: RegexHolder,
+    arg_info: ArgInfo,
+}
 
 #[derive(Debug, PartialOrd, PartialEq, Clone)]
 struct TimestampWithoutYear {
@@ -75,7 +79,7 @@ struct YBLogFilePreamble {
 
 impl YBLogLine {
     fn parse_tablet_id(line: &str, context: &YBLogReaderContext) -> Option<Uuid> {
-        match context.tablet_id_re.captures(line) {
+        match context.regexes.tablet_id_re.captures(line) {
             Some(captures) => match Uuid::from_str(captures.get(1).unwrap().as_str()) {
                 Ok(parsed_uuid) => Some(parsed_uuid),
                 _ => None,
@@ -85,44 +89,44 @@ impl YBLogLine {
     }
 
     pub fn parse(line: &str, context: Arc<YBLogReaderContext>) -> Option<YBLogLine> {
-        match context.yb_log_line_re.captures(line) {
+        match context.regexes.yb_log_line_re.captures(line) {
             Some(captures) =>
                 {
                     Some(YBLogLine {
                         log_level: parse_capture(
-                            captures.get(YBLogReaderContext::CAPTURE_INDEX_LOG_LEVEL),
+                            captures.get(RegexHolder::CAPTURE_INDEX_LOG_LEVEL),
                         ),
                         timestamp_without_year: TimestampWithoutYear {
                             month: parse_capture(
-                                captures.get(YBLogReaderContext::CAPTURE_INDEX_MONTH),
+                                captures.get(RegexHolder::CAPTURE_INDEX_MONTH),
                             ),
                             day: parse_capture(
-                                captures.get(YBLogReaderContext::CAPTURE_INDEX_DAY),
+                                captures.get(RegexHolder::CAPTURE_INDEX_DAY),
                             ),
                             hour: parse_capture(
-                                captures.get(YBLogReaderContext::CAPTURE_INDEX_HOUR),
+                                captures.get(RegexHolder::CAPTURE_INDEX_HOUR),
                             ),
                             minute: parse_capture(
-                                captures.get(YBLogReaderContext::CAPTURE_INDEX_MINUTE),
+                                captures.get(RegexHolder::CAPTURE_INDEX_MINUTE),
                             ),
                             second: parse_capture(
-                                captures.get(YBLogReaderContext::CAPTURE_INDEX_SECOND),
+                                captures.get(RegexHolder::CAPTURE_INDEX_SECOND),
                             ),
                             microsecond: parse_capture(
-                                captures.get(YBLogReaderContext::CAPTURE_INDEX_MICROSECOND),
+                                captures.get(RegexHolder::CAPTURE_INDEX_MICROSECOND),
                             ),
                         },
                         thread_id: parse_capture(
-                            captures.get(YBLogReaderContext::CAPTURE_INDEX_THREAD_ID),
+                            captures.get(RegexHolder::CAPTURE_INDEX_THREAD_ID),
                         ),
                         file_name: String::from(
                             captures
-                                .get(YBLogReaderContext::CAPTURE_INDEX_FILE_NAME)
+                                .get(RegexHolder::CAPTURE_INDEX_FILE_NAME)
                                 .unwrap()
                                 .as_str(),
                         ),
                         line_number: parse_capture(
-                            captures.get(YBLogReaderContext::CAPTURE_INDEX_LINE_NUMBER),
+                            captures.get(RegexHolder::CAPTURE_INDEX_LINE_NUMBER),
                         ),
                         tablet_id: YBLogLine::parse_tablet_id(line, context.as_ref()),
                     })
@@ -199,7 +203,7 @@ impl YBLogReader {
             let line = maybe_line.unwrap();
 
             if line_index <= PREAMBLE_NUM_LINES {
-                if let Some(captures) = self.context.log_file_created_at_re.captures(
+                if let Some(captures) = self.context.regexes.log_file_created_at_re.captures(
                         line.as_str()) {
                     let created_at = NaiveDate::from_ymd(
                         parse_capture(captures.get(1)),
@@ -212,7 +216,7 @@ impl YBLogReader {
                     );
                     self.preamble.created_at = Some(created_at);
 
-                    if let Some(ts_upper_limit) = self.context.highest_timestamp {
+                    if let Some(ts_upper_limit) = self.context.arg_info.highest_timestamp {
                         if created_at > ts_upper_limit {
                             println!(
                                 "Skipping {} because it was created at {} but the user specified \
@@ -223,7 +227,8 @@ impl YBLogReader {
                         }
                     }
                 }
-                if let Some(captures) = self.context.running_on_machine_re.captures(line.as_str()) {
+                if let Some(captures) = self.context.regexes.running_on_machine_re.captures(
+                        line.as_str()) {
                     self.preamble.running_on_machine = Some(
                         String::from(captures.get(1).unwrap().as_str()));
                 }
@@ -232,7 +237,7 @@ impl YBLogReader {
             let maybe_parsed_line = YBLogLine::parse(line.as_str(), self.context.clone());
             if let Some(parsed_line) = maybe_parsed_line {
                 let year = self.preamble.created_at.map(|d| d.year()).or(
-                    self.context.default_year).unwrap();
+                    self.context.arg_info.default_year).unwrap();
                 let ts_with_year = parsed_line.timestamp_without_year.with_year(year);
                 successfully_parsed_lines += 1;
                 // Parsing success
@@ -302,6 +307,21 @@ impl TimestampArgHelper {
     }
 }
 
+// ------------------------------------------------------------------------------------------------
+// ArgInfo
+// ------------------------------------------------------------------------------------------------
+
+struct ArgInfo {
+    pub lowest_timestamp: Option<NaiveDateTime>,
+    highest_timestamp: Option<NaiveDateTime>,
+    default_year: Option<i32>,
+    input_files: Vec<String>,
+}
+
+// ------------------------------------------------------------------------------------------------
+// ArgParsingHelper
+// ------------------------------------------------------------------------------------------------
+
 struct ArgParsingHelper {
     lowest_helper: TimestampArgHelper,
     highest_helper: TimestampArgHelper,
@@ -315,12 +335,12 @@ impl ArgParsingHelper {
         }
     }
 
-    pub fn parse_args<'a>(&'a self) -> ArgMatches<'a> {
-        App::new("Yugabyte log processor")
+    pub fn parse_args<'a>(&'a self) -> ArgInfo {
+        let matches = App::new("Yugabyte log processor")
             .about("A tool for manipulating YugabyteDB logs")
             .version("1.0.0")
             .arg(
-                Arg::with_name("INPUT")
+                Arg::with_name("INPUT_FILES")
                     .help("Sets the input file to use")
                     .required(true)
                     .multiple(true),
@@ -332,56 +352,67 @@ impl ArgParsingHelper {
                     .help("Use this year when year is unknown in a glog timestamp")
                     .required(true)
                     .takes_value(true))
-            .get_matches()
+            .get_matches();
+
+        let lowest_timestamp = get_timestamp_arg(matches.values_of("LOWEST_TIMESTAMP"));
+        let highest_timestamp = get_timestamp_arg(matches.values_of("HIGHEST_TIMESTAMP"));
+
+        // See https://github.com/clap-rs/clap/pull/74/files
+        let default_year: Option<i32> = match value_t!(matches.value_of("DEFAULT_YEAR"), i32) {
+            Ok(year) => Some(year),
+            Err(err) => { panic!("Error parsing DEFAULT_YEAR: {:?}", err) }
+        };
+        let input_files: Vec<String> = match matches.values_of("INPUT_FILES") {
+            Some(values) => {
+                values.map(|s| String::from(s)).collect()
+            },
+            _ => panic!("No input files specified"),
+        };
+        ArgInfo {
+            lowest_timestamp,
+            highest_timestamp,
+            default_year,
+            input_files,
+        }
     }
 }
 
+// ------------------------------------------------------------------------------------------------
+// Main program
+// ------------------------------------------------------------------------------------------------
 fn main() {
     let parsing_helper = ArgParsingHelper::new();
-    let matches = parsing_helper.parse_args();
-    let lowest_timestamp = get_timestamp_arg(matches.values_of("LOWEST_TIMESTAMP"));
-    let highest_timestamp = get_timestamp_arg(matches.values_of("HIGHEST_TIMESTAMP"));
-
-    // See https://github.com/clap-rs/clap/pull/74/files
-    let default_year: Option<i32> = match value_t!(matches.value_of("DEFAULT_YEAR"), i32) {
-        Ok(year) => Some(year),
-        Err(err) => { panic!("Error parsing DEFAULT_YEAR: {:?}", err) }
-    };
+    let arg_info = parsing_helper.parse_args();
 
     let mut input_files: BTreeSet<OsString> = BTreeSet::new();
-    match matches.values_of("INPUT") {
-        Some(values) => {
-            for input_file in values {
-                let file_metadata = metadata(input_file).unwrap();
-                if file_metadata.is_file() {
-                    println!("input file: {}", input_file);
-                    if !Path::new(input_file).exists() {
-                        panic!("File {} does not exist", input_file);
-                    }
-                    input_files.insert(fs::canonicalize(input_file).unwrap().into_os_string());
-                } else if file_metadata.is_dir() {
-                    for entry in WalkDir::new(input_file) {
-                        let path_unwrapped = entry.unwrap();
-                        let path_os_str = path_unwrapped.path();
-                        if metadata(path_os_str).unwrap().is_file() {
-                            input_files.insert(fs::canonicalize(path_os_str).unwrap().into_os_string());
-                        }
-                    }
-                } else {
-                    panic!("Not a file or directory: {}", input_file);
+
+    for input_file_str in arg_info.input_files.iter() {
+        let input_file = input_file_str.as_str();
+        let file_metadata = metadata(input_file).unwrap();
+        if file_metadata.is_file() {
+            println!("input file: {}", input_file);
+            if !Path::new(input_file).exists() {
+                panic!("File {} does not exist", input_file);
+            }
+            input_files.insert(fs::canonicalize(input_file).unwrap().into_os_string());
+        } else if file_metadata.is_dir() {
+            for entry in WalkDir::new(input_file) {
+                let path_unwrapped = entry.unwrap();
+                let path_os_str = path_unwrapped.path();
+                if metadata(path_os_str).unwrap().is_file() {
+                    input_files.insert(fs::canonicalize(path_os_str).unwrap().into_os_string());
                 }
             }
+        } else {
+            panic!("Not a file or directory: {}", input_file);
         }
-        _ => panic!("No input files specified"),
     }
 
     let mut readers = Vec::<YBLogReader>::new();
-    let mut context = YBLogReaderContext::new();
-    context.lowest_timestamp = lowest_timestamp;
-    context.highest_timestamp = highest_timestamp;
-    context.default_year = default_year;
-
-    let reader_context = Arc::new(context);
+    let mut reader_context = Arc::new(YBLogReaderContext {
+        regexes: RegexHolder::new(),
+        arg_info,
+    });
 
     let cpus = num_cpus::get();
     let pool = ThreadPool::new(cpus);
