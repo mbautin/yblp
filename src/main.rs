@@ -6,7 +6,7 @@ use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::fs::metadata;
 
-use clap::{App, Arg};
+use clap::{App, Arg, ArgMatches};
 use flate2;
 use regex::Regex;
 use uuid::Uuid;
@@ -213,7 +213,7 @@ impl YBLogReader {
                     self.preamble.created_at = Some(created_at);
 
                     if let Some(ts_upper_limit) = self.context.highest_timestamp {
-                        if (created_at > ts_upper_limit) {
+                        if created_at > ts_upper_limit {
                             println!(
                                 "Skipping {} because it was created at {} but the user specified \
                                  {} as the highest timestamp of interest",
@@ -302,29 +302,43 @@ impl TimestampArgHelper {
     }
 }
 
+struct ArgParsingHelper {
+    lowest_helper: TimestampArgHelper,
+    highest_helper: TimestampArgHelper,
+}
+
+impl ArgParsingHelper {
+    fn new() -> ArgParsingHelper {
+        ArgParsingHelper {
+            lowest_helper: TimestampArgHelper::new("lowest"),
+            highest_helper: TimestampArgHelper::new("highest")
+        }
+    }
+
+    pub fn parse_args<'a>(&'a self) -> ArgMatches<'a> {
+        App::new("Yugabyte log processor")
+            .about("A tool for manipulating YugabyteDB logs")
+            .version("1.0.0")
+            .arg(
+                Arg::with_name("INPUT")
+                    .help("Sets the input file to use")
+                    .required(true)
+                    .multiple(true),
+            )
+            .arg(self.lowest_helper.create_arg())
+            .arg(self.highest_helper.create_arg())
+            .arg(Arg::with_name("DEFAULT_YEAR")
+                    .long("--default-year")
+                    .help("Use this year when year is unknown in a glog timestamp")
+                    .required(true)
+                    .takes_value(true))
+            .get_matches()
+    }
+}
 
 fn main() {
-    let lowest_helper = TimestampArgHelper::new("lowest");
-    let highest_helper = TimestampArgHelper::new("highest");
-
-    let matches = App::new("Yugabyte log processor")
-        .about("A tool for manipulating YugabyteDB logs")
-        .version("1.0.0")
-        .arg(
-            Arg::with_name("INPUT")
-                .help("Sets the input file to use")
-                .required(true)
-                .multiple(true),
-        )
-        .arg(lowest_helper.create_arg())
-        .arg(highest_helper.create_arg())
-        .arg(Arg::with_name("DEFAULT_YEAR")
-                .long("--default-year")
-                .help("Use this year when year is unknown in a glog timestamp")
-                .required(true)
-                .takes_value(true))
-        .get_matches();
-
+    let parsing_helper = ArgParsingHelper::new();
+    let matches = parsing_helper.parse_args();
     let lowest_timestamp = get_timestamp_arg(matches.values_of("LOWEST_TIMESTAMP"));
     let highest_timestamp = get_timestamp_arg(matches.values_of("HIGHEST_TIMESTAMP"));
 
