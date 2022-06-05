@@ -1,3 +1,6 @@
+#[macro_use]
+extern crate clap;
+
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
@@ -12,6 +15,7 @@ use walkdir::WalkDir;
 use std::fs;
 use std::ffi::OsString;
 use threadpool::ThreadPool;
+use chrono::Datelike;
 
 use std::str::FromStr;
 use std::collections::BTreeSet;
@@ -32,7 +36,15 @@ struct TimestampWithoutYear {
     hour: u8,
     minute: u8,
     second: u8,
-    microsecond: i32,
+    microsecond: u32,
+}
+
+impl TimestampWithoutYear {
+    fn with_year(&self, year: i32) -> NaiveDateTime {
+        NaiveDate::from_ymd(year, u32::from(self.month), u32::from(self.day)).and_hms_micro(
+            u32::from(self.hour), u32::from(self.minute), u32::from(self.second),
+            u32::from(self.microsecond))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -181,10 +193,47 @@ impl YBLogReader {
         const PREAMBLE_NUM_LINES: usize = 10;
         let mut successfully_parsed_lines: u64 = 0;
         let mut unsuccessfully_parsed_lines: u64 = 0;
+
+        let mut year_from_preamble_opt: Option<i32> = None;
         for maybe_line in &mut self.reader {
             let line = maybe_line.unwrap();
+
+            if line_index <= PREAMBLE_NUM_LINES {
+                if let Some(captures) = self.context.log_file_created_at_re.captures(
+                        line.as_str()) {
+                    let created_at = NaiveDate::from_ymd(
+                        parse_capture(captures.get(1)),
+                        parse_capture(captures.get(2)),
+                        parse_capture(captures.get(3))
+                    ).and_hms(
+                        parse_capture(captures.get(4)),
+                        parse_capture(captures.get(5)),
+                        parse_capture(captures.get(6))
+                    );
+                    self.preamble.created_at = Some(created_at);
+
+                    if let Some(ts_upper_limit) = self.context.highest_timestamp {
+                        if (created_at > ts_upper_limit) {
+                            println!(
+                                "Skipping {} because it was created at {} but the user specified \
+                                 {} as the highest timestamp of interest",
+                                self.file_name, created_at, ts_upper_limit
+                            );
+                            break;
+                        }
+                    }
+                }
+                if let Some(captures) = self.context.running_on_machine_re.captures(line.as_str()) {
+                    self.preamble.running_on_machine = Some(
+                        String::from(captures.get(1).unwrap().as_str()));
+                }
+            }
+
             let maybe_parsed_line = YBLogLine::parse(line.as_str(), self.context.clone());
-            if let Some(_parsed_line) = maybe_parsed_line {
+            if let Some(parsed_line) = maybe_parsed_line {
+                let year = self.preamble.created_at.map(|d| d.year()).or(
+                    self.context.default_year).unwrap();
+                let ts_with_year = parsed_line.timestamp_without_year.with_year(year);
                 successfully_parsed_lines += 1;
                 // Parsing success
             } else {
@@ -192,26 +241,6 @@ impl YBLogReader {
                 unsuccessfully_parsed_lines += 1;
             }
 
-            if line_index <= PREAMBLE_NUM_LINES {
-                if let Some(captures) = self.context.log_file_created_at_re.captures(
-                    line.as_str()) {
-                    self.preamble.created_at = Some(
-                        NaiveDate::from_ymd(
-                            parse_capture(captures.get(1)),
-                            parse_capture(captures.get(2)),
-                            parse_capture(captures.get(3))
-                        ).and_hms(
-                            parse_capture(captures.get(4)),
-                            parse_capture(captures.get(5)),
-                            parse_capture(captures.get(6))
-                        )
-                    );
-                }
-                if let Some(captures) = self.context.running_on_machine_re.captures(line.as_str()) {
-                    self.preamble.running_on_machine = Some(
-                        String::from(captures.get(1).unwrap().as_str()));
-                }
-            }
             line_index += 1;
         }
         println!(
@@ -229,10 +258,13 @@ fn timestamp_validator(v: String) -> Result<(), String> {
     }
 }
 
-fn get_timestamp_arg<'a>(values: Option<clap::Values<'a>>) -> Option<NaiveDateTime> {
-    match values.unwrap().next() {
-        Some(value_str) => {
-            Some(parse_filter_timestamp(value_str).unwrap())
+fn get_timestamp_arg<'a>(values_opt: Option<clap::Values<'a>>) -> Option<NaiveDateTime> {
+    match values_opt {
+        Some(mut values) => match values.next() {
+            Some(value_str) => {
+                Some(parse_filter_timestamp(value_str).unwrap())
+            },
+            None => None
         },
         None => None
     }
@@ -254,7 +286,7 @@ impl TimestampArgHelper {
     fn new(lowest_or_highest: &str) -> TimestampArgHelper {
         TimestampArgHelper {
             arg_name: String::from(lowest_or_highest.to_uppercase()) + "_TIMESTAMP",
-            long_option_name: String::from(lowest_or_highest.to_lowercase()) + "_timestamp",
+            long_option_name: String::from(lowest_or_highest.to_lowercase()) + "-timestamp",
             help_text: std::format!(
                     "{} timestamp (inclusive) of the log range to look at (YYYY-MM-DD HH:MM:SS)",
                     capitalize_string(lowest_or_highest))
@@ -286,10 +318,21 @@ fn main() {
         )
         .arg(lowest_helper.create_arg())
         .arg(highest_helper.create_arg())
+        .arg(Arg::with_name("DEFAULT_YEAR")
+                .long("--default-year")
+                .help("Use this year when year is unknown in a glog timestamp")
+                .required(true)
+                .takes_value(true))
         .get_matches();
 
-    let from_ts = get_timestamp_arg(matches.values_of("LOWEST_TIMESTAMP"));
-    let to_ts = get_timestamp_arg(matches.values_of("HIGHEST_TIMESTAMP"));
+    let lowest_timestamp = get_timestamp_arg(matches.values_of("LOWEST_TIMESTAMP"));
+    let highest_timestamp = get_timestamp_arg(matches.values_of("HIGHEST_TIMESTAMP"));
+
+    // See https://github.com/clap-rs/clap/pull/74/files
+    let default_year: Option<i32> = match value_t!(matches.value_of("DEFAULT_YEAR"), i32) {
+        Ok(year) => Some(year),
+        Err(err) => { panic!("Error parsing DEFAULT_YEAR: {:?}", err) }
+    };
 
     let mut input_files: BTreeSet<OsString> = BTreeSet::new();
     match matches.values_of("INPUT") {
@@ -319,7 +362,12 @@ fn main() {
     }
 
     let mut readers = Vec::<YBLogReader>::new();
-    let reader_context = Arc::new(YBLogReaderContext::new());
+    let mut context = YBLogReaderContext::new();
+    context.lowest_timestamp = lowest_timestamp;
+    context.highest_timestamp = highest_timestamp;
+    context.default_year = default_year;
+
+    let reader_context = Arc::new(context);
 
     let cpus = num_cpus::get();
     let pool = ThreadPool::new(cpus);

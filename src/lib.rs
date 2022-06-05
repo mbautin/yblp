@@ -6,15 +6,6 @@ fn parse_regex(s: &str) -> Regex {
     Regex::new(s).unwrap()
 }
 
-pub struct YBLogReaderContext {
-    pub yb_log_line_re: Regex,
-    pub tablet_id_re: Regex,
-    pub log_file_created_at_re: Regex,
-    pub running_on_machine_re: Regex,
-    pub application_fingerprint_re: Regex,
-    pub application_fingerprint_details_re: Regex,
-}
-
 pub fn parse_capture<T: FromStr>(capture: Option<regex::Match>) -> T {
     if let Ok(result) = capture.unwrap().as_str().parse::<T>() {
         result
@@ -50,6 +41,23 @@ pub fn parse_filter_timestamp(s_raw: &str) -> Result<NaiveDateTime, String> {
     }
     Err(format!(
         "Could not parse timestamp '{}': expected YYYY-MM-DD or YYYY-MM-DD[ tT]HH:MM:SS format", s))
+}
+
+// ------------------------------------------------------------------------------------------------
+// YBLogReaderContext
+// ------------------------------------------------------------------------------------------------
+
+pub struct YBLogReaderContext {
+    pub yb_log_line_re: Regex,
+    pub tablet_id_re: Regex,
+    pub log_file_created_at_re: Regex,
+    pub running_on_machine_re: Regex,
+    pub application_fingerprint_re: Regex,
+    pub application_fingerprint_details_re: Regex,
+
+    pub lowest_timestamp: Option<NaiveDateTime>,
+    pub highest_timestamp: Option<NaiveDateTime>,
+    pub default_year: Option<i32>,
 }
 
 impl YBLogReaderContext {
@@ -119,9 +127,13 @@ impl YBLogReaderContext {
                 r"build_type ([a-zA-Z]+) ",
                 r"built at (.*)"
                 )
-            )
+            ),
             // version 2.4.0.0 build 60 revision 4a56a6497b3bbc559f995d30f20f3859debce629 build_type
             // RELEASE built at 21 Jan 2021 02:12:34 UTC
+
+            lowest_timestamp: None,
+            highest_timestamp: None,
+            default_year: None,
         }
     }
 }
