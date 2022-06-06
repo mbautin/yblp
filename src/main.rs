@@ -20,17 +20,43 @@ use chrono::Datelike;
 
 use std::str::FromStr;
 use std::collections::BTreeSet;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::cell::RefCell;
 
 extern crate yblp;
 
 use self::yblp::parse_capture;
+use self::yblp::parse_regex;
 use self::yblp::parse_filter_timestamp;
+
+// ------------------------------------------------------------------------------------------------
+// OutputCollector -- collects output data
+// ------------------------------------------------------------------------------------------------
+
+struct OutputCollector {
+    output_lines: Vec<YBLogLine>
+}
+
+impl OutputCollector {
+    fn new() -> OutputCollector {
+        OutputCollector {
+            output_lines: Vec::new(),
+        }
+    }
+
+    fn sort_lines(&mut self) {
+    }
+}
+
+// ------------------------------------------------------------------------------------------------
+// YBLogReaderContext -- shared across all processing threads
+// ------------------------------------------------------------------------------------------------
+
 
 struct YBLogReaderContext {
     regexes: RegexHolder,
     arg_info: ArgInfo,
+    output_collector: Arc<Mutex<OutputCollector>>,
 }
 
 #[derive(Debug, PartialOrd, PartialEq, Clone)]
@@ -54,11 +80,12 @@ impl TimestampWithoutYear {
 #[derive(Debug, Clone)]
 struct YBLogLine {
     log_level: char,
-    timestamp_without_year: TimestampWithoutYear,
+    timestamp: NaiveDateTime,
     thread_id: i64,
     file_name: String,
     line_number: i32,
     tablet_id: Option<Uuid>,
+    message: String,
 }
 
 struct LogChunk {
@@ -88,7 +115,10 @@ impl YBLogLine {
         }
     }
 
-    pub fn parse(line: &str, context: Arc<YBLogReaderContext>) -> Option<YBLogLine> {
+    pub fn parse(
+            line: &str,
+            context: Arc<YBLogReaderContext>,
+            year: i32) -> Option<YBLogLine> {
         match context.regexes.yb_log_line_re.captures(line) {
             Some(captures) =>
                 {
@@ -96,26 +126,16 @@ impl YBLogLine {
                         log_level: parse_capture(
                             captures.get(RegexHolder::CAPTURE_INDEX_LOG_LEVEL),
                         ),
-                        timestamp_without_year: TimestampWithoutYear {
-                            month: parse_capture(
-                                captures.get(RegexHolder::CAPTURE_INDEX_MONTH),
+                        timestamp: NaiveDate::from_ymd(
+                                year,
+                                parse_capture(captures.get(RegexHolder::CAPTURE_INDEX_MONTH)),
+                                parse_capture(captures.get(RegexHolder::CAPTURE_INDEX_DAY)),
+                            ).and_hms_micro(
+                                parse_capture(captures.get(RegexHolder::CAPTURE_INDEX_HOUR)),
+                                parse_capture(captures.get(RegexHolder::CAPTURE_INDEX_MINUTE)),
+                                parse_capture(captures.get(RegexHolder::CAPTURE_INDEX_SECOND)),
+                                parse_capture(captures.get(RegexHolder::CAPTURE_INDEX_MICROSECOND)),
                             ),
-                            day: parse_capture(
-                                captures.get(RegexHolder::CAPTURE_INDEX_DAY),
-                            ),
-                            hour: parse_capture(
-                                captures.get(RegexHolder::CAPTURE_INDEX_HOUR),
-                            ),
-                            minute: parse_capture(
-                                captures.get(RegexHolder::CAPTURE_INDEX_MINUTE),
-                            ),
-                            second: parse_capture(
-                                captures.get(RegexHolder::CAPTURE_INDEX_SECOND),
-                            ),
-                            microsecond: parse_capture(
-                                captures.get(RegexHolder::CAPTURE_INDEX_MICROSECOND),
-                            ),
-                        },
                         thread_id: parse_capture(
                             captures.get(RegexHolder::CAPTURE_INDEX_THREAD_ID),
                         ),
@@ -129,6 +149,7 @@ impl YBLogLine {
                             captures.get(RegexHolder::CAPTURE_INDEX_LINE_NUMBER),
                         ),
                         tablet_id: YBLogLine::parse_tablet_id(line, context.as_ref()),
+                        message: parse_capture(captures.get(RegexHolder::CAPTURE_INDEX_MESSAGE)),
                     })
                 }
             _ => None,
@@ -197,8 +218,10 @@ impl YBLogReader {
         const PREAMBLE_NUM_LINES: usize = 10;
         let mut successfully_parsed_lines: u64 = 0;
         let mut unsuccessfully_parsed_lines: u64 = 0;
+        let mut skipped_lines: u64 = 0;
 
         let mut year_from_preamble_opt: Option<i32> = None;
+        let output_collector_mutex: &Mutex<OutputCollector> = &self.context.output_collector;
         for maybe_line in &mut self.reader {
             let line = maybe_line.unwrap();
 
@@ -234,25 +257,60 @@ impl YBLogReader {
                 }
             }
 
-            let maybe_parsed_line = YBLogLine::parse(line.as_str(), self.context.clone());
-            if let Some(parsed_line) = maybe_parsed_line {
+            let line_str = line.as_str();
+            let mut should_skip = false;
+            if let Some(line_contains) = &self.context.arg_info.line_contains {
+                if !line.contains(line_contains.as_str()) {
+                    should_skip = true;
+                }
+            }
+
+            if (!should_skip) {
                 let year = self.preamble.created_at.map(|d| d.year()).or(
                     self.context.arg_info.default_year).unwrap();
-                let ts_with_year = parsed_line.timestamp_without_year.with_year(year);
-                successfully_parsed_lines += 1;
-                // Parsing success
-            } else {
-                // Parsing failure
-                unsuccessfully_parsed_lines += 1;
+                let maybe_parsed_line = YBLogLine::parse(line_str, self.context.clone(), year);
+                if let Some(parsed_line) = maybe_parsed_line {
+                    // Parsing success
+
+                    let timestamp = &parsed_line.timestamp;
+
+                    if let Some(highest_ts) = self.context.arg_info.highest_timestamp {
+                        if *timestamp > highest_ts {
+                            should_skip = true;
+                        }
+                    }
+                    if let Some(lowest_ts) = self.context.arg_info.lowest_timestamp {
+                        if *timestamp < lowest_ts {
+                            should_skip = true;
+                        }
+                    }
+
+                    successfully_parsed_lines += 1;
+
+                    if (!should_skip) {
+                        let output_lock = output_collector_mutex.lock();
+                        output_lock.unwrap().output_lines.push(parsed_line);
+                    }
+                } else {
+                    // Parsing failure
+                    unsuccessfully_parsed_lines += 1;
+                }
+            }
+
+            if (should_skip) {
+                skipped_lines += 1;
             }
 
             line_index += 1;
         }
         println!(
-            "In file {}: successfully parsed lines: {}, unsuccessfully parsed lines: {}",
+            "In file {}: successfully parsed lines: {}, \
+             unsuccessfully parsed lines: {} \
+             skipped lines: {}",
             self.file_name,
             successfully_parsed_lines,
-            unsuccessfully_parsed_lines);
+            unsuccessfully_parsed_lines,
+            skipped_lines);
     }
 }
 
@@ -293,7 +351,8 @@ impl TimestampArgHelper {
             arg_name: String::from(lowest_or_highest.to_uppercase()) + "_TIMESTAMP",
             long_option_name: String::from(lowest_or_highest.to_lowercase()) + "-timestamp",
             help_text: std::format!(
-                    "{} timestamp (inclusive) of the log range to look at (YYYY-MM-DD HH:MM:SS)",
+                    "{} timestamp (inclusive) of the log range to look at (YYYY-MM-DD HH:MM:SS, \
+                     YYYY-MM-DDTHH:MM:SS, or only a date of the YYYY-MM-DD format).",
                     capitalize_string(lowest_or_highest))
         }
     }
@@ -312,10 +371,12 @@ impl TimestampArgHelper {
 // ------------------------------------------------------------------------------------------------
 
 struct ArgInfo {
-    pub lowest_timestamp: Option<NaiveDateTime>,
+    lowest_timestamp: Option<NaiveDateTime>,
     highest_timestamp: Option<NaiveDateTime>,
     default_year: Option<i32>,
     input_files: Vec<String>,
+    name_regex: Option<Regex>,
+    line_contains: Option<String>,
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -352,6 +413,19 @@ impl ArgParsingHelper {
                     .help("Use this year when year is unknown in a glog timestamp")
                     .required(true)
                     .takes_value(true))
+            .arg(Arg::with_name("NAME_REGEX")
+                    .long("--name-regex")
+                    .help("Only look at files with names, not including any directory names, \
+                           matching this regular expression. E.g. specify [.]INFO[.] to only look \
+                           at INFO log files. This regex is not anchored at either end.")
+                    .takes_value(true))
+            .arg(Arg::with_name("LINE_CONTAINS")
+                    .long("--line-contains")
+                    .help("Only look at lines that contain this substring (not a regex). \
+                           We will still look at some number of initial lines in each log file so \
+                           we can identify some log file metadata. This can speed up log \
+                           processing significantly.")
+                    .takes_value(true))
             .get_matches();
 
         let lowest_timestamp = get_timestamp_arg(matches.values_of("LOWEST_TIMESTAMP"));
@@ -362,17 +436,29 @@ impl ArgParsingHelper {
             Ok(year) => Some(year),
             Err(err) => { panic!("Error parsing DEFAULT_YEAR: {:?}", err) }
         };
-        let input_files: Vec<String> = match matches.values_of("INPUT_FILES") {
+        let name_regex = match matches.values_of("NAME_REGEX") {
+            Some(mut values) => {
+                Some(parse_regex(values.next().unwrap()))
+            },
+            _ => None
+        };
+        let mut input_files: Vec<String> = match matches.values_of("INPUT_FILES") {
             Some(values) => {
                 values.map(|s| String::from(s)).collect()
             },
             _ => panic!("No input files specified"),
+        };
+        let line_contains = match matches.values_of("LINE_CONTAINS") {
+            Some(mut values) => { Some(String::from(values.next().unwrap())) },
+            _ => None
         };
         ArgInfo {
             lowest_timestamp,
             highest_timestamp,
             default_year,
             input_files,
+            name_regex,
+            line_contains,
         }
     }
 }
@@ -408,10 +494,36 @@ fn main() {
         }
     }
 
+    if let Some(actual_name_regex) = arg_info.name_regex.clone() {
+        let num_before_filter = input_files.len();
+        input_files = input_files.into_iter().filter(|name| {
+            let path = Path::new(name);
+            if let Some(file_name) = path.file_name() {
+                if let Some(file_name_str) = file_name.to_str() {
+                    actual_name_regex.is_match(file_name_str)
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        }).collect::<BTreeSet<_>>();
+        let num_after_filter = input_files.len();
+        println!("Filtered {} input files to {} by applying name regex {:?}",
+                 num_before_filter, num_after_filter, arg_info.name_regex);
+    } else {
+        println!("--name-regex not specified");
+    }
+
+
     let mut readers = Vec::<YBLogReader>::new();
-    let mut reader_context = Arc::new(YBLogReaderContext {
+
+    let output_collector_ptr = Arc::new(Mutex::new(OutputCollector::new()));
+
+    let reader_context = Arc::new(YBLogReaderContext {
         regexes: RegexHolder::new(),
         arg_info,
+        output_collector: output_collector_ptr.clone(),
     });
 
     let cpus = num_cpus::get();
@@ -428,5 +540,16 @@ fn main() {
             reader.load();
         })
     }
+
     pool.join();
+    let guard = output_collector_ptr.lock().unwrap();
+
+    // TODO: can we get data out of a mutex without cloning it?
+    let mut lines = guard.output_lines.clone();
+
+    lines.sort_by(|a: &YBLogLine, b: &YBLogLine| a.timestamp.partial_cmp(&b.timestamp).unwrap());
+
+    for line in &lines {
+        println!("Output line: {:?}", line);
+    }
 }

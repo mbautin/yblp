@@ -2,7 +2,7 @@ use std::str::FromStr;
 use regex::Regex;
 use chrono::{NaiveDateTime, NaiveDate};
 
-fn parse_regex(s: &str) -> Regex {
+pub fn parse_regex(s: &str) -> Regex {
     Regex::new(s).unwrap()
 }
 
